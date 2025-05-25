@@ -25,7 +25,7 @@ A bridge between WiZ smart lights and MQTT, enabling local control and integrati
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/yourusername/localwiz-mqtt.git
+   git clone https://github.com/jussikin/localwiz-mqtt.git
    cd localwiz-mqtt
    ```
 
