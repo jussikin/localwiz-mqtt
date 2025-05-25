@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  wiz-mqtt-bridge:
+    build: .
+    container_name: wiz-mqtt-bridge
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/Helsinki  # Set your timezone
+      # Uncomment and set these or use a .env file
+      # - MQTT_BROKER=mosquitto
+      # - MQTT_PORT=1883
+      # - MQTT_USERNAME=user
+      # - MQTT_PASSWORD=password
+      # - MQTT_TOPIC=homeassistant/light/wiz
+      # - BROADCAST_ADDRESSES=192.168.1.255,192.168.0.255
+    network_mode: host  # Required for UDP broadcast to work
+    volumes:
+      - ./.env:/app/.env:ro
+    # Uncomment if you're using a local MQTT broker
+    # depends_on:
+    #   - mosquitto
+
+  # Uncomment if you want to run a local MQTT broker
+  # mosquitto:
+  #   image: eclipse-mosquitto:2
+  #   container_name: mosquitto
+  #   restart: unless-stopped
+  #   ports:
+  #     - "1883:1883"
+  #     - "9001:9001"  # MQTT over WebSocket
+  #   volumes:
+  #     - mosquitto_data:/mosquitto/data
+  #     - mosquitto_log:/mosquitto/log
+  #     - mosquitto_config:/mosquitto/config
+
+# Uncomment if using the local MQTT broker
+# volumes:
+#   mosquitto_data:
+#   mosquitto_log:
+#   mosquitto_config:

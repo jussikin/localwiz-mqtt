@@ -1,0 +1,11 @@
+[project]
+name = "localwiz-mqtt"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pywizlight>=0.6.2",
+    "python-dotenv>=1.0.0",
+    "paho-mqtt>=2.0.0"
+]
