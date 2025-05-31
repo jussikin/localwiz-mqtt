@@ -15,6 +15,9 @@ services:
       # - MQTT_TOPIC=homeassistant/light/wiz
       # - BROADCAST_ADDRESSES=192.168.1.255,192.168.0.255
     network_mode: host  # Required for UDP broadcast to work
+    cap_add:
+      - NET_ADMIN  # Add network admin capabilities
+    privileged: true  # Required for raw socket access
     volumes:
       - ./.env:/app/.env:ro
     # Uncomment if you're using a local MQTT broker
