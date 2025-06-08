@@ -63,6 +63,49 @@ class LightInfo:
     color: Optional[tuple]
     model: Optional[str] = None
     firmware_version: Optional[str] = None
+    connected: bool = True  # Track if light is currently connected
+    
+    @classmethod
+    def from_bulb_state(cls, bulb, state, previous_light=None):
+        """Create a LightInfo instance from a bulb and its state."""
+        mac = bulb.mac.lower()
+        
+        # Safely get model and firmware version with fallbacks
+        try:
+            model = state.get('module_name') or (previous_light.model if previous_light else None)
+        except (AttributeError, KeyError):
+            model = previous_light.model if previous_light else None
+            
+        try:
+            fw_version = state.get('fw_version') or (previous_light.firmware_version if previous_light else None)
+        except (AttributeError, KeyError):
+            fw_version = previous_light.firmware_version if previous_light else None
+        
+        # Get the current state and brightness
+        light_state = state.get('state', False)
+        brightness = state.get('dimming', 100) if light_state else 0
+        
+        # Check for circadian mode or other special modes
+        scene_id = state.get('sceneId')
+        is_circadian = scene_id and 'circadian' in str(scene_id).lower()
+        
+        # If in circadian mode, ensure light is reported as on with the current brightness
+        if is_circadian and brightness > 0:
+            light_state = True
+        # Only force state to off if not in a special mode and brightness is 0
+        elif brightness == 0 and light_state and not is_circadian:
+            light_state = False
+            
+        return cls(
+            ip=bulb.ip,
+            mac=mac,
+            state=light_state,
+            brightness=brightness if light_state else 0,
+            color=state.get('rgb', (255, 255, 255)) if light_state else None,
+            model=model,
+            firmware_version=fw_version,
+            connected=True
+        )
 
 class MQTTClient:
     def __init__(self):
@@ -267,39 +310,61 @@ class MQTTClient:
             print(f"PUBLISHING {len(lights)} LIGHTS TO MQTT")
             print("="*50)
             
-            # Publish to the main discovery topic with all lights
-            payload = {
-                'lights': [asdict(light) for light in lights],
-                'timestamp': int(time.time() * 1000)  # Current time in milliseconds
-            }
+            # Get connected and total light counts
+            connected_lights = sum(1 for light in lights if light.connected)
             
-            print(f"\n📤 PUBLISHING TO MAIN TOPIC: {self.discovery_topic}")
+            # Publish discovery message
+            discovery_payload = {
+                "total_lights": len(self.lights),
+                "connected_lights": connected_lights,
+                "timestamp": int(time.time())
+            }
             
             self.client.publish(
                 self.discovery_topic,
-                json.dumps(payload, default=str),
+                json.dumps(discovery_payload),
                 qos=1,
                 retain=True
             )
             
-            if not lights:
-                print("⚠️ No lights to publish.")
-                return
-                
-            # Publish each light to its own topic
+            # Publish each light's state
             for light in lights:
                 try:
                     light_mac = light.mac.replace(':', '').lower()
                     light_topic = f"{self.base_topic}/{light_mac}"
-                    light_dict = asdict(light)
                     
-                    # Publish full light info
-                    self.client.publish(
-                        light_topic,
-                        json.dumps(light_dict, default=str),
-                        qos=1,
-                        retain=True
-                    )
+                    # Create a dictionary with light info
+                    light_dict = {
+                        "ip": light.ip,
+                        "mac": light.mac,
+                        "state": "ON" if light.connected and light.state else "OFF",
+                        "brightness": light.brightness if light.connected else 0,
+                        "color": light.color if light.connected else None,
+                        "model": light.model,
+                        "firmware": light.firmware_version,
+                        "connected": light.connected,
+                        "last_seen": int(time.time()) if light.connected else None,
+                        "status": "online" if light.connected else "offline"
+                    }
+                    
+                    # Publish to the light's topic with retain=True to ensure status persists
+                    try:
+                        self.client.publish(
+                            light_topic,
+                            json.dumps({k: v for k, v in light_dict.items() if v is not None}, default=str),
+                            qos=1,
+                            retain=True
+                        )
+                        
+                        # Explicitly publish the connection status with retain=True
+                        self.client.publish(
+                            f"{light_topic}/connected",
+                            "online" if light.connected else "offline",
+                            qos=1,
+                            retain=True
+                        )
+                    except Exception as e:
+                        print(f"❌ Error publishing to MQTT for light {light.mac}: {e}")
                     
                     # Publish individual states
                     self._publish_individual_states(light)
@@ -307,7 +372,7 @@ class MQTTClient:
                 except Exception as e:
                     print(f"❌ Error publishing light {light.mac}: {e}")
                     
-            print("\n✅ Finished publishing light data")
+            print(f"\n✅ Finished publishing light data ({connected_lights}/{len(self.lights)} connected)")
             
         except Exception as e:
             print(f"❌ Error in publish_lights: {e}")
@@ -323,23 +388,28 @@ class MQTTClient:
             
             # Publish individual state updates
             states = {
-                'state': ('ON' if light.state else 'OFF', 'State'),
-                'brightness': (light.brightness if light.brightness is not None else 0, 'Brightness'),
-                'color': (light.color if light.color else [255, 255, 255], 'Color'),
-                'model': (light.model or 'unknown', 'Model'),
-                'firmware': (light.firmware_version or 'unknown', 'Firmware'),
-                'online': ('true' if light.ip else 'false', 'Online')
+                'state': ('ON' if light.connected and light.state else 'OFF', 'State'),
+                'brightness': (light.brightness if light.connected and light.brightness is not None else 0, 'Brightness'),
+                'color': (light.color if light.connected else None, 'Color'),
+                'model': (light.model, 'Model'),
+                'firmware': (light.firmware_version, 'Firmware'),
+                'connected': ('online' if light.connected else 'offline', 'Connection Status')
             }
             
-            for attr, (value, name) in states.items():
-                topic = f"{base_topic}/{attr}"
+            for key, (value, name) in states.items():
                 try:
-                    # For Home Assistant compatibility
-                    if attr in ['state', 'brightness', 'color']:
-                        payload = str(value).lower() if isinstance(value, str) else value
+                    topic = f"{base_topic}/{key}"
+                    # Skip None values
+                    if value is None:
+                        continue
+                        
+                    # Convert value to JSON string if it's a complex type
+                    if isinstance(value, (list, tuple, dict)):
+                        payload = json.dumps(value, default=str)
                     else:
                         payload = value
-                        
+                    
+                    # Ensure payload is a string for MQTT
                     if not isinstance(payload, (str, int, float, bool)):
                         payload = json.dumps(payload, default=str)
                         
@@ -356,11 +426,12 @@ class MQTTClient:
         except Exception as e:
             print(f"❌ Error in _publish_individual_states: {e}")
 
-async def discover_lights() -> List[LightInfo]:
+async def discover_lights(previous_lights: Dict[str, LightInfo] = None) -> List[LightInfo]:
     print("Scanning for WiZ lights...")
     # Get broadcast addresses from .env file or use defaults
     broadcast_addresses = get_broadcast_addresses()
     discovered_lights = []
+    current_macs = set()
     
     bulbs = []
     for addr in broadcast_addresses:
@@ -371,40 +442,125 @@ async def discover_lights() -> List[LightInfo]:
                 bulbs.extend(found)
                 print(f"Found {len(found)} lights on {addr}")
         except Exception as e:
-            print(f"Error scanning {addr}: {e}")
+            print(f"  Error discovering on {addr}: {e}")
     
     if not bulbs:
         print("No WiZ lights found on the network.")
-        return []
+        # Mark all previously discovered lights as disconnected
+        if previous_lights:
+            for mac, light in previous_lights.items():
+                if light.connected:  # Only update if was previously connected
+                    light.connected = False
+                    print(f"Light {mac} is now disconnected")
+                    discovered_lights.append(light)
+        return discovered_lights
     
-    print(f"\nFound {len(bulbs)} WiZ light(s):")
-    print("-" * 50)
+    print(f"\nFound {len(bulbs)} WiZ lights. Getting details...")
     
-    discovered_lights = []
-    for i, bulb in enumerate(bulbs, 1):
+    # Track which MACs we've found in this discovery
+    found_macs = set()
+    
+    # Process each discovered bulb
+    for bulb in bulbs:
         try:
-            # Get the bulb's state and config
+            # Get the state of the bulb
             state = await bulb.updateState()
-            config = await bulb.getBulbConfig()
+            mac = bulb.mac.lower()
+            found_macs.add(mac)
             
-            light_info = LightInfo(
-                ip=bulb.ip,
-                mac=bulb.mac,
-                state=state.get_state(),
-                brightness=state.get_brightness(),
-                color=state.get_rgb(),
-                model=config.get('module_name') if config else None,
-                firmware_version=config.get('fwVersion') if config else None
-            )
+            # Debug: Print complete state object info
+            print("\n" + "="*80)
+            print(f"BULB STATE INSPECTION - IP: {bulb.ip}, MAC: {mac}")
+            print("-" * 80)
+            
+            # 1. Print state object type and attributes
+            print(f"State object type: {type(state).__name__}")
+            if hasattr(state, '__dict__'):
+                print("State object attributes:")
+                for attr, value in state.__dict__.items():
+                    print(f"  {attr}: {value} ({type(value).__name__})")
+            
+            # 2. Try to get state dict in different ways
+            state_dict = {}
+            
+            # First check for pilotResult which contains the actual state
+            if hasattr(state, 'pilotResult'):
+                pilot_result = getattr(state, 'pilotResult', {})
+                if isinstance(pilot_result, dict):
+                    print("\nState from pilotResult:")
+                    for key, value in pilot_result.items():
+                        print(f"  {key}: {value} ({type(value).__name__})")
+                    state_dict.update(pilot_result)
+            
+            # Then check _state
+            if hasattr(state, '_state'):
+                _state = getattr(state, '_state', {})
+                print("\nState from _state attribute:")
+                for key, value in _state.items():
+                    if key not in state_dict:  # Don't override pilotResult values
+                        print(f"  {key}: {value} ({type(value).__name__})")
+                        state_dict[key] = value
+            
+            # 3. Try to get state using get_state() if it exists
+            if hasattr(state, 'get_state'):
+                try:
+                    state_method_dict = state.get_state()
+                    print("\nState from get_state() method:")
+                    if isinstance(state_method_dict, dict):
+                        for key, value in state_method_dict.items():
+                            print(f"  {key}: {value} ({type(value).__name__})")
+                        state_dict.update(state_method_dict)
+                except Exception as e:
+                    print(f"Error calling get_state(): {e}")
+            
+            # 4. Try direct attribute access for known important fields
+            print("\nDirect attribute access:")
+            for attr in ['state', 'get_state', 'brightness', 'dimming', 'sceneId', 'scene', 'scene_name', 'get_scene']:
+                if hasattr(state, attr):
+                    try:
+                        value = getattr(state, attr)
+                        if callable(value):
+                            try:
+                                value = value()
+                                print(f"  {attr} (method result): {value} ({type(value).__name__})")
+                                if isinstance(value, dict):
+                                    state_dict.update(value)
+                            except Exception as e:
+                                print(f"  {attr} (method call failed): {e}")
+                        else:
+                            print(f"  {attr}: {value} ({type(value).__name__})")
+                            state_dict[attr] = value
+                    except Exception as e:
+                        print(f"  Error accessing {attr}: {e}")
+            
+            print("\nFinal state_dict:", state_dict)
+            print("=" * 80 + "\n")
+            
+            # Check if we already know about this light
+            previous_light = previous_lights.get(mac) if previous_lights else None
+            
+            # Create or update light info using the new factory method
+            light_info = LightInfo.from_bulb_state(bulb, state_dict, previous_light)
+            
+            if previous_light:
+                if not previous_light.connected:
+                    print(f"Light {mac} has reconnected")
+                # Preserve previous values if not available in current state
+                light_info.model = light_info.model or previous_light.model
+                light_info.firmware_version = light_info.firmware_version or previous_light.firmware_version
+            else:
+                print(f"Discovered new light: {mac}")
             
             discovered_lights.append(light_info)
             
             # Print light info
-            print(f"Light {i}:")
+            status = "CONNECTED" if light_info.connected else "DISCONNECTED"
+            print("\n" + "="*50)
+            print(f"Light: {light_info.model or 'Unknown model'} ({status})")
             print(f"  IP: {light_info.ip}")
             print(f"  MAC: {light_info.mac}")
-            print(f"  Model: {light_info.model or 'N/A'}")
-            print(f"  Firmware: {light_info.firmware_version or 'N/A'}")
+            if light_info.firmware_version:
+                print(f"  Firmware: {light_info.firmware_version}")
             print(f"  State: {'On' if light_info.state else 'Off'}")
             print(f"  Brightness: {light_info.brightness}%" if light_info.brightness is not None else "  Brightness: N/A")
             print(f"  Color: {light_info.color}" if light_info.color else "  Color: White")
@@ -415,6 +571,17 @@ async def discover_lights() -> List[LightInfo]:
             
         except Exception as e:
             print(f"  Error getting state for bulb {bulb.ip}: {e}")
+    
+    # Check for lights that were previously connected but not found in this discovery
+    if previous_lights:
+        for mac, light in previous_lights.items():
+            if mac not in found_macs and light.connected:
+                # Only update if the light was previously connected to avoid duplicate updates
+                light.connected = False
+                print(f"Light {mac} is now disconnected")
+                # Add to discovered_lights to ensure the status update is published
+                if light not in discovered_lights:
+                    discovered_lights.append(light)
     
     return discovered_lights
 
@@ -523,18 +690,27 @@ async def main_loop():
     
     try:
         last_discovery = 0
-        discovery_interval = 300  # 5 minutes between discoveries
+        # Get discovery interval from environment variable, default to 300 seconds (5 minutes)
+        discovery_interval = int(os.getenv('DISCOVERY_INTERVAL', '300'))
+        print(f"🔧 Discovery interval set to {discovery_interval} seconds")
+        previous_lights = {}
         
         while running:
             current_time = time.time()
-            # Check if it's time for periodic discovery
-            if current_time - last_discovery > discovery_interval:
+            
+            # Run discovery if it's time
+            if current_time - last_discovery >= discovery_interval or not previous_lights:
+                print(f"\n🔍 Running discovery...")
                 try:
-                    lights = await discover_lights()
-                    if mqtt_client:
+                    # Pass the previous lights to track connection status
+                    lights = await discover_lights(previous_lights)
+                    
+                    # Update our previous_lights dictionary with the current state
+                    previous_lights = {light.mac.lower(): light for light in lights}
+                    
+                    if mqtt_client and mqtt_client.connected:
                         mqtt_client.publish_lights(lights)
                     last_discovery = current_time
-                    print(f"✅ Discovered {len(lights)} lights at {time.strftime('%Y-%m-%d %H:%M:%S')}")
                 except Exception as e:
                     print(f"❌ Error during discovery: {e}")
             
